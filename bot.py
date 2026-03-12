@@ -1,5 +1,7 @@
 import os
 import logging
+import json
+import base64
 from collections import defaultdict
 from telegram import Update, BotCommand
 from telegram.ext import (
@@ -9,11 +11,11 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-import anthropic
+import httpx
 
 # Kalitlar Railway muhit o'zgaruvchilaridan olinadi
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 BOT_NAME = "AI Yordamchi"
 MAX_HISTORY = 20
@@ -41,52 +43,117 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 chat_histories = defaultdict(list)
 
+GEMINI_CHAT_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_IMAGE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
 
-def ask_claude(user_id: int, user_message: str) -> str:
-    chat_histories[user_id].append({"role": "user", "content": user_message})
+
+def ask_gemini(user_id: int, user_message: str) -> str:
+    """Gemini API ga matn so'rovi yuboradi."""
+    chat_histories[user_id].append({
+        "role": "user",
+        "parts": [{"text": user_message}],
+    })
 
     if len(chat_histories[user_id]) > MAX_HISTORY:
         chat_histories[user_id] = chat_histories[user_id][-MAX_HISTORY:]
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=chat_histories[user_id],
-        )
-        assistant_message = response.content[0].text
-        chat_histories[user_id].append({"role": "assistant", "content": assistant_message})
-        return assistant_message
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": SYSTEM_PROMPT}]
+            },
+            "contents": chat_histories[user_id],
+            "generationConfig": {
+                "maxOutputTokens": 1024,
+            },
+        }
 
-    except anthropic.AuthenticationError:
-        return "🔑 Claude API kaliti noto'g'ri. Railway sozlamalarini tekshiring."
-    except anthropic.RateLimitError:
-        return "⏳ So'rovlar limiti tugadi. Bir oz kutib, qayta urinib ko'ring."
-    except anthropic.APIError as e:
-        logger.error(f"Claude API xatosi: {e}")
-        return "⚠️ Kechirasiz, hozir javob bera olmayapman. Keyinroq urinib ko'ring."
+        with httpx.Client(timeout=60) as client:
+            response = client.post(GEMINI_CHAT_URL, json=payload)
+            data = response.json()
+
+        if "error" in data:
+            logger.error(f"Gemini xatosi: {data['error']}")
+            return f"⚠️ Xatolik: {data['error'].get('message', 'Noma\'lum xato')}"
+
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+        chat_histories[user_id].append({
+            "role": "model",
+            "parts": [{"text": text}],
+        })
+
+        return text
+
     except Exception as e:
-        logger.error(f"Kutilmagan xato: {e}")
-        return "❌ Xatolik yuz berdi. /start bosing va qayta urinib ko'ring."
+        logger.error(f"Gemini xatosi: {e}")
+        return "⚠️ Kechirasiz, hozir javob bera olmayapman. Keyinroq urinib ko'ring."
 
+
+def generate_image(prompt: str) -> tuple:
+    """Gemini API orqali rasm yaratadi. (image_bytes, error_text) qaytaradi."""
+    try:
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": f"Generate a high quality, detailed image of: {prompt}"}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+            },
+        }
+
+        with httpx.Client(timeout=120) as client:
+            response = client.post(GEMINI_IMAGE_URL, json=payload)
+            data = response.json()
+
+        if "error" in data:
+            return None, f"⚠️ Xatolik: {data['error'].get('message', 'Noma\'lum xato')}"
+
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+
+        for part in parts:
+            if "inlineData" in part:
+                image_data = part["inlineData"]["data"]
+                image_bytes = base64.b64decode(image_data)
+                return image_bytes, None
+
+        # Rasm topilmadi
+        text_response = ""
+        for part in parts:
+            if "text" in part:
+                text_response = part["text"]
+
+        return None, text_response or "❌ Rasm yaratib bo'lmadi. Boshqa tavsif bilan urinib ko'ring."
+
+    except Exception as e:
+        logger.error(f"Rasm yaratish xatosi: {e}")
+        return None, "⚠️ Rasm yaratishda xatolik. Keyinroq urinib ko'ring."
+
+
+# ═══════════════════════════════════════════════
+#  TELEGRAM BUYRUQLARI
+# ═══════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_histories[user.id] = []
     welcome = (
         f"Salom, {user.first_name}! 👋\n\n"
-        f"Men **{BOT_NAME}**man — Claude AI asosida ishlaydigan aqlli yordamchi.\n\n"
-        "🧠 Menga istalgan savolingizni yozing:\n"
-        "• Dasturlash, matematika, fan\n"
-        "• Tarjima qilish\n"
-        "• Maslahat va g'oyalar\n"
-        "• Matn yozish va tahlil qilish\n\n"
+        f"Men **{BOT_NAME}**man — Gemini AI asosida ishlaydigan aqlli yordamchi.\n\n"
+        "🧠 **Savol berish** — oddiy matn yozing\n"
+        "🎨 **Rasm yaratish** — /image buyrug'ini ishlating\n\n"
+        "**Misol:**\n"
+        "`/image Tog'lar orasida quyosh botishi`\n"
+        "`/image Koinotda suzayotgan astronavt`\n\n"
         "📋 **Buyruqlar:**\n"
         "/start — Yangi suhbat boshlash\n"
+        "/image — Rasm yaratish\n"
         "/clear — Suhbat tarixini tozalash\n"
         "/help — Yordam\n\n"
         "Menga yozing! ✨"
@@ -102,20 +169,57 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "🔍 **Yordam**\n\n"
-        "Oddiy matn yozing — men javob beraman!\n\n"
+        "🧠 **Savol berish** — oddiy matn yozing\n"
+        "🎨 **Rasm yaratish** — `/image tavsif`\n\n"
+        "**Misol:**\n"
+        "`/image Bahorgi gullagan bog'`\n\n"
         "**Buyruqlar:**\n"
         "/start — Yangi suhbat\n"
+        "/image — Rasm yaratish\n"
         "/clear — Tarixni tozalash\n"
         "/help — Yordam\n\n"
         "💡 **Maslahatlar:**\n"
         "• Savolni aniq yozing\n"
         "• Men oldingi xabarlarni eslayman\n"
-        "• Yangi mavzu uchun /clear bosing"
+        "• Rasm uchun batafsil tavsif yozing"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rasm yaratish — /image buyrug'i"""
+    prompt = " ".join(context.args) if context.args else ""
+
+    if not prompt:
+        await update.message.reply_text(
+            "🎨 Rasm tavsifini yozing!\n\n"
+            "**Misol:**\n"
+            "`/image Tog'lar orasida quyosh botishi`\n"
+            "`/image Kosmosda suzayotgan mushuk`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(f"🎨 Rasm yaratilmoqda: *{prompt}*\n⏳ Iltimos, kuting...", parse_mode="Markdown")
+    await update.message.chat.send_action("upload_photo")
+
+    image_bytes, error = generate_image(prompt)
+
+    if image_bytes:
+        from io import BytesIO
+        photo = BytesIO(image_bytes)
+        photo.name = "generated_image.png"
+        await update.message.reply_photo(
+            photo=photo,
+            caption=f"🎨 *{prompt}*",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(error)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Oddiy xabarlarni qayta ishlash."""
     user_message = update.message.text
     if not user_message or not user_message.strip():
         return
@@ -124,7 +228,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[{update.effective_user.first_name}]: {user_message[:80]}")
 
     await update.message.chat.send_action("typing")
-    reply = ask_claude(user_id, user_message)
+    reply = ask_gemini(user_id, user_message)
 
     if len(reply) > 4000:
         for i in range(0, len(reply), 4000):
@@ -136,6 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "Yangi suhbat boshlash"),
+        BotCommand("image", "Rasm yaratish"),
         BotCommand("clear", "Tarixni tozalash"),
         BotCommand("help", "Yordam"),
     ])
@@ -149,6 +254,7 @@ def main():
     print("🤖 Bot ishga tushmoqda...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
